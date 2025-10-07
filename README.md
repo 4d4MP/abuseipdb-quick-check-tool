@@ -14,6 +14,10 @@ well‑formatted table in the console or written directly to a CSV file.
   improved performance.
 - **Progress indicator**: A terminal progress bar shows how many queries have
   completed.
+- **Script-friendly authentication**: Provide the API key via the
+  `ABUSEIPDB_API_KEY` environment variable or interactively when omitted.
+- **Input validation**: IPv4 and IPv6 addresses are validated before requests
+  are sent so malformed entries are skipped with a clear message.
 - **Filter by confidence**: Optionally exclude results with an
   `abuseConfidenceScore` less than `100` using the `-x/--exclude` flag.
 - **CSV output**: Save results to a CSV file instead of printing a table.

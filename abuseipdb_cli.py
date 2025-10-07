@@ -31,6 +31,7 @@ import re
 import sys
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from functools import partial
+import ipaddress
 
 import requests
 
@@ -80,9 +81,47 @@ HEADERS = [
 ]
 
 
-def get_api_key() -> str:
-    """Prompt the user for an API key using getpass."""
+ENV_API_KEY = "ABUSEIPDB_API_KEY"
+
+
+def resolve_api_key() -> str:
+    """Return the AbuseIPDB API key from env vars or by prompting the user.
+
+    The CLI previously always prompted via ``getpass`` which makes it
+    difficult to script.  This helper first checks the ``ABUSEIPDB_API_KEY``
+    environment variable so the tool can be automated or used inside shell
+    pipelines without interactive input.  If no environment variable is
+    present an interactive prompt is still shown.
+    """
+
+    env_key = os.environ.get(ENV_API_KEY, "").strip()
+    if env_key:
+        return env_key
     return getpass.getpass("Enter your AbuseIPDB API key: ")
+
+
+def get_api_key() -> str:
+    """Backward compatible wrapper returning the resolved API key."""
+
+    return resolve_api_key()
+
+
+def normalize_ip(ip: str) -> str | None:
+    """Return a stripped IP string or ``None`` if invalid.
+
+    The previous implementation accepted any text.  Using ``ipaddress`` gives
+    immediate feedback on malformed input while still allowing IPv6 entries.
+    """
+
+    sanitized = ip.strip().strip("'\"")
+    if not sanitized:
+        return None
+
+    try:
+        ipaddress.ip_address(sanitized)
+    except ValueError:
+        return None
+    return sanitized
 
 
 def read_ips_from_csv(path: str) -> list[str]:
@@ -95,15 +134,23 @@ def read_ips_from_csv(path: str) -> list[str]:
         A list of non-empty IP strings.
     """
     ips: list[str] = []
+    invalid_count = 0
     try:
         with open(path, "r", encoding="utf-8") as f:
-            for line in f:
-                ip = line.strip().strip("'\"")
+            for raw_line in f:
+                ip = normalize_ip(raw_line)
                 if ip:
                     ips.append(ip)
+                else:
+                    invalid_count += 1
     except OSError as e:
         print(f"Could not read CSV file '{path}': {e}")
         return []
+    if invalid_count:
+        print(
+            f"Skipped {invalid_count} entr{'y' if invalid_count == 1 else 'ies'} "
+            "that were not valid IP addresses."
+        )
     return ips
 
 
@@ -115,7 +162,14 @@ def get_ip_list_from_prompt() -> list[str]:
     if not ip_input:
         return []
     ip_list = re.split(r"[;,]", ip_input)
-    return [ip.strip("'\"").strip() for ip in ip_list if ip.strip("'\"").strip()]
+    sanitized: list[str] = []
+    for raw_ip in ip_list:
+        ip = normalize_ip(raw_ip)
+        if ip:
+            sanitized.append(ip)
+    if len(sanitized) != len([ip for ip in ip_list if ip.strip()]):
+        print("One or more entries were ignored because they are not valid IPs.")
+    return sanitized
 
 
 def print_table(ip_results: list[dict]):
@@ -162,6 +216,20 @@ def write_csv(path: str, rows: list[dict]):
         print(f"Failed to write CSV '{path}': {e}")
 
 
+def build_error_result(ip: str, message: str) -> dict:
+    """Return a uniform error payload for downstream display."""
+
+    return {
+        "ipAddress": ip,
+        "abuseConfidenceScore": "ERR",
+        "totalReports": "-",
+        "domain": message,
+        "countryCode": "-",
+        "usageType": "-",
+        "isTor": "-",
+    }
+
+
 def check_ip(session: requests.Session, api_key: str, ip: str) -> dict | None:
     """Query a single IP address via AbuseIPDB API and return result.
 
@@ -177,58 +245,26 @@ def check_ip(session: requests.Session, api_key: str, ip: str) -> dict | None:
     Returns:
         A dictionary of result data, or None on invalid or empty input.
     """
-    ip = ip.replace(",", "").replace(";", "").strip()
+    ip = normalize_ip(ip)
     if not ip:
         return None
 
-    url = f"https://api.abuseipdb.com/api/v2/check?ipAddress={ip}"
+    url = "https://api.abuseipdb.com/api/v2/check"
     headers = {"Accept": "application/json", "Key": api_key}
 
     try:
-        resp = session.get(url, headers=headers, timeout=10)
+        resp = session.get(url, headers=headers, params={"ipAddress": ip}, timeout=10)
         resp.raise_for_status()
         data = resp.json().get("data", {})
         return data
     except requests.exceptions.HTTPError as http_err:
-        return {
-            "ipAddress": ip,
-            "abuseConfidenceScore": "ERR",
-            "totalReports": "-",
-            "domain": f"HTTP error: {http_err}",
-            "countryCode": "-",
-            "usageType": "-",
-            "isTor": "-",
-        }
+        return build_error_result(ip, f"HTTP error: {http_err}")
     except requests.exceptions.ConnectionError as ce:
-        return {
-            "ipAddress": ip,
-            "abuseConfidenceScore": "ERR",
-            "totalReports": "-",
-            "domain": f"Connection error: {ce}",
-            "countryCode": "-",
-            "usageType": "-",
-            "isTor": "-",
-        }
+        return build_error_result(ip, f"Connection error: {ce}")
     except requests.exceptions.Timeout:
-        return {
-            "ipAddress": ip,
-            "abuseConfidenceScore": "ERR",
-            "totalReports": "-",
-            "domain": "Request timeout",
-            "countryCode": "-",
-            "usageType": "-",
-            "isTor": "-",
-        }
+        return build_error_result(ip, "Request timeout")
     except requests.exceptions.RequestException as err:
-        return {
-            "ipAddress": ip,
-            "abuseConfidenceScore": "ERR",
-            "totalReports": "-",
-            "domain": f"Unexpected error: {err}",
-            "countryCode": "-",
-            "usageType": "-",
-            "isTor": "-",
-        }
+        return build_error_result(ip, f"Unexpected error: {err}")
 
 
 def print_progress_bar(
