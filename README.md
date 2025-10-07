@@ -27,6 +27,30 @@ well‑formatted table in the console or written directly to a CSV file.
 - Python 3.8 or higher
 - `requests` library (`pip install requests`)
 
+## PowerShell alternative
+
+Users restricted to Windows environments without Python support can run the
+`AbuseIPDBQuickCheck.ps1` script that ships with this repository. It uses only
+built-in cmdlets (for example `Invoke-RestMethod`) so no additional modules are
+required.
+
+### PowerShell usage
+
+```powershell
+# query a list of IPs provided inline
+./AbuseIPDBQuickCheck.ps1 -IpAddress 1.1.1.1, 8.8.8.8
+
+# read IPs from a text/CSV file and export the results to another CSV
+./AbuseIPDBQuickCheck.ps1 -InputFile .\ips.csv -OutputFile .\results.csv
+
+# pipe IP addresses from another command and filter to confidence score 100
+Get-Content .\ips.txt | ./AbuseIPDBQuickCheck.ps1 -ExcludeConfidenceLessThan100
+```
+
+The script resolves your API key from the `ABUSEIPDB_API_KEY` environment
+variable or prompts for it interactively, validates IPv4 and IPv6 addresses, and
+prints a table or writes CSV output based on the provided parameters.
+
 ## Usage
 
 ```bash
