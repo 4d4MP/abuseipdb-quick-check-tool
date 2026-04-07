@@ -550,6 +550,7 @@ def main() -> None:
     console = Console(
         no_color=args.no_color,
         force_terminal=None if not args.no_color else False,
+        stderr=args.json_output,
     )
 
     # Backward compatibility: -x → -t 100
