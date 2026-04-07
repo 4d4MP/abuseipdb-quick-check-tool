@@ -716,7 +716,7 @@ def write_csv(path: str, rows: list[dict], headers: list[str], console: Console)
 
 
 def print_summary(rows: list[dict], console: Console) -> None:
-    """Print a summary panel with risk-level statistics."""
+    """Print a summary panel with risk-level statistics and API usage."""
     total = len(rows)
     if total == 0:
         console.print("[dim]No results to summarize.[/]")
@@ -744,6 +744,25 @@ def print_summary(rows: list[dict], console: Console) -> None:
     ]
     if errors:
         parts.append(f"[dim]Errors:[/] {errors}")
+
+    # Include API usage in the summary if available
+    info = _rate_limit_info.copy()
+    if info:
+        remaining = info.get("X-RateLimit-Remaining", "?")
+        limit = info.get("X-RateLimit-Limit", "?")
+        try:
+            remaining_int = int(remaining)
+            limit_int = int(limit)
+            pct = remaining_int / limit_int * 100 if limit_int else 0
+            if pct <= 10:
+                quota_color = "bold red"
+            elif pct <= 30:
+                quota_color = "yellow"
+            else:
+                quota_color = "green"
+        except (ValueError, TypeError):
+            quota_color = "dim"
+        parts.append(f"  [{quota_color}]API: {remaining}/{limit} remaining[/]")
 
     console.print(
         Panel(
@@ -912,15 +931,15 @@ def output_results(
         print(json.dumps(filtered, indent=2, default=str))
     elif args.output_file:
         write_csv(args.output_file, rows, headers, console)
+        # Show rate limit when outputting to CSV (no summary panel in this path)
+        if not args.json_output:
+            print_rate_limit(console)
     else:
         print_table(rows, headers, console)
-        print_summary(rows, console)
+        print_summary(rows, console)  # includes API usage inline
     # HTML export (can be combined with any other output)
     if args.export:
         export_html(args.export, rows, headers, console)
-    # Always show rate-limit info (unless JSON mode)
-    if not args.json_output:
-        print_rate_limit(console)
 
 
 # ---------------------------------------------------------------------------
