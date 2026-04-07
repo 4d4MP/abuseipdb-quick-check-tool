@@ -236,11 +236,46 @@ def _clear_cached_key() -> None:
         pass
 
 
+def _validate_api_key(api_key: str) -> tuple[bool, str]:
+    """Test the API key with a lightweight request.
+
+    Returns ``(True, "")`` on success or ``(False, reason)`` on failure.
+    Also captures rate-limit headers from the validation response.
+    """
+    try:
+        resp = requests.get(
+            "https://api.abuseipdb.com/api/v2/check",
+            headers={"Accept": "application/json", "Key": api_key},
+            params={"ipAddress": "127.0.0.1", "maxAgeInDays": 1},
+            timeout=10,
+        )
+        # Capture rate-limit headers so we can show usage immediately
+        with _rate_limit_lock:
+            for hdr in ("X-RateLimit-Limit", "X-RateLimit-Remaining", "Retry-After"):
+                val = resp.headers.get(hdr)
+                if val is not None:
+                    _rate_limit_info[hdr] = val
+        if resp.status_code == 401:
+            return False, "Invalid API key (HTTP 401 Unauthorized)."
+        if resp.status_code == 429:
+            return False, "API rate limit exceeded. Try again later."
+        resp.raise_for_status()
+        return True, ""
+    except requests.exceptions.ConnectionError:
+        # Can't reach API — assume key is fine, validate later at query time
+        return True, ""
+    except requests.exceptions.Timeout:
+        return True, ""
+    except requests.exceptions.RequestException as exc:
+        return False, str(exc)
+
+
 def resolve_api_key(console: Console, clear_cache: bool = False) -> str:
     """Return the AbuseIPDB API key from env → cache → interactive prompt.
 
     The key is cached to ``~/.config/abuseipdb/.api_key`` for 1 hour so
-    users don't have to re-enter it on every invocation.
+    users don't have to re-enter it on every invocation.  When obtained from
+    an interactive prompt the key is validated before caching.
     """
     if clear_cache:
         _clear_cached_key()
@@ -257,12 +292,28 @@ def resolve_api_key(console: Console, clear_cache: bool = False) -> str:
         console.print("[dim]Using cached API key (valid for up to 1 hour).[/]")
         return cached
 
-    # 3. Interactive prompt → cache
-    key = Prompt.ask(
-        "[bold cyan]Enter your AbuseIPDB API key[/]", password=True, console=console
-    )
-    _save_cached_key(key)
-    return key
+    # 3. Interactive prompt → validate → cache
+    while True:
+        key = Prompt.ask(
+            "[bold cyan]Enter your AbuseIPDB API key[/]",
+            password=True,
+            console=console,
+        )
+        if not key.strip():
+            console.print("[bold red]Error:[/] API key cannot be empty.")
+            continue
+        key = key.strip()
+
+        console.print("[dim]Validating API key…[/]", end="")
+        ok, reason = _validate_api_key(key)
+        if ok:
+            console.print(" [green]OK[/]")
+            _save_cached_key(key)
+            return key
+        else:
+            console.print(f" [bold red]Failed[/]")
+            console.print(f"[bold red]Error:[/] {reason}")
+            console.print("[yellow]Please try again.[/]")
 
 
 # ---------------------------------------------------------------------------
@@ -283,17 +334,25 @@ def normalize_ip(ip: str) -> str | None:
 
 
 def read_ips_from_csv(path: str, console: Console) -> list[str]:
-    """Read IP addresses from a CSV file (one per line)."""
+    """Read IP addresses from a CSV file.
+
+    Handles one-IP-per-line as well as comma/semicolon-separated entries
+    within each line (e.g. ``5.4.63.7,`` or ``1.1.1.1,2.2.2.2``).
+    """
     ips: list[str] = []
     invalid_count = 0
     try:
         with open(path, "r", encoding="utf-8") as f:
             for raw_line in f:
-                ip = normalize_ip(raw_line)
-                if ip:
-                    ips.append(ip)
-                else:
-                    invalid_count += 1
+                for chunk in re.split(r"[;,\s]+", raw_line):
+                    chunk = chunk.strip()
+                    if not chunk:
+                        continue
+                    ip = normalize_ip(chunk)
+                    if ip:
+                        ips.append(ip)
+                    else:
+                        invalid_count += 1
     except OSError as e:
         console.print(f"[bold red]Error:[/] Could not read CSV file '{path}': {e}")
         return []
@@ -329,26 +388,175 @@ def read_ips_from_stdin(console: Console) -> list[str]:
     return ips
 
 
-def get_ip_list_from_prompt(console: Console) -> list[str]:
-    """Prompt the user for IP addresses separated by commas or semicolons."""
+def _show_interactive_help(console: Console) -> None:
+    """Print help text for the interactive session."""
+    help_table = Table(
+        title="Interactive Commands",
+        box=box.SIMPLE,
+        header_style="bold cyan",
+        show_edge=False,
+    )
+    help_table.add_column("Command", style="bold")
+    help_table.add_column("Description")
+    help_table.add_row("-v", "Toggle verbose mode (show ISP, lastReportedAt, numDistinctUsers)")
+    help_table.add_row("-d N", "Set max report age in days (e.g. -d 30)")
+    help_table.add_row("-t N", "Set score threshold (e.g. -t 50)")
+    help_table.add_row("-x", "Set threshold to 100 (only show confirmed abuse)")
+    help_table.add_row("--sort KEY", "Sort by: score, reports, country, ip")
+    help_table.add_row("--export FILE", "Export results to HTML file")
+    help_table.add_row("-o FILE", "Write results to CSV file")
+    help_table.add_row("--json", "Toggle JSON output mode")
+    help_table.add_row("usage", "Show API rate-limit / quota status")
+    help_table.add_row("help", "Show this help")
+    help_table.add_row("(empty)", "Exit")
+    console.print(help_table)
+    console.print()
+
+
+# Flags that can be toggled/set during interactive mode.
+_INTERACTIVE_FLAGS = re.compile(
+    r"^(?:-v|--verbose|-x|--exclude|--json|--no-color|help"
+    r"|-d\s+\d+|--days\s+\d+"
+    r"|-t\s+\d+|--threshold\s+\d+"
+    r"|--sort\s+\w+"
+    r"|--export\s+\S+"
+    r"|-o\s+\S+|--output-file\s+\S+)$"
+)
+
+
+def parse_interactive_input(
+    raw: str,
+    args: argparse.Namespace,
+    console: Console,
+) -> list[str]:
+    """Parse interactive input that may contain a mix of IPs and runtime flags.
+
+    Recognised flags are applied to *args* in-place; the remaining tokens are
+    treated as IP addresses and returned as a list.
+    """
+    tokens = re.split(r"[;,\s]+", raw)
+    ip_list: list[str] = []
+    idx = 0
+    while idx < len(tokens):
+        tok = tokens[idx].strip()
+        if not tok:
+            idx += 1
+            continue
+
+        # --- commands / flags ---
+        if tok in ("help", "?"):
+            _show_interactive_help(console)
+            idx += 1
+            continue
+
+        if tok == "usage":
+            print_rate_limit(console)
+            idx += 1
+            continue
+
+        if tok in ("-v", "--verbose"):
+            args.verbose = not args.verbose
+            state = "ON" if args.verbose else "OFF"
+            console.print(f"[cyan]Verbose mode:[/] {state}")
+            idx += 1
+            continue
+
+        if tok in ("-x", "--exclude"):
+            args.threshold = 100
+            console.print("[cyan]Threshold set to:[/] 100")
+            idx += 1
+            continue
+
+        if tok == "--json":
+            args.json_output = not args.json_output
+            state = "ON" if args.json_output else "OFF"
+            console.print(f"[cyan]JSON output:[/] {state}")
+            idx += 1
+            continue
+
+        if tok in ("-d", "--days") and idx + 1 < len(tokens):
+            try:
+                args.days = int(tokens[idx + 1])
+                console.print(f"[cyan]Max report age:[/] {args.days} days")
+            except ValueError:
+                console.print("[yellow]Warning:[/] -d requires a number.")
+            idx += 2
+            continue
+
+        if tok in ("-t", "--threshold") and idx + 1 < len(tokens):
+            try:
+                args.threshold = int(tokens[idx + 1])
+                console.print(f"[cyan]Threshold set to:[/] {args.threshold}")
+            except ValueError:
+                console.print("[yellow]Warning:[/] -t requires a number.")
+            idx += 2
+            continue
+
+        if tok == "--sort" and idx + 1 < len(tokens):
+            val = tokens[idx + 1]
+            if val in ("score", "reports", "country", "ip"):
+                args.sort = val
+                console.print(f"[cyan]Sort by:[/] {val}")
+            else:
+                console.print(
+                    f"[yellow]Warning:[/] Unknown sort key '{val}'. "
+                    "Use: score, reports, country, ip"
+                )
+            idx += 2
+            continue
+
+        if tok == "--export" and idx + 1 < len(tokens):
+            args.export = tokens[idx + 1]
+            console.print(f"[cyan]HTML export:[/] {args.export}")
+            idx += 2
+            continue
+
+        if tok in ("-o", "--output-file") and idx + 1 < len(tokens):
+            args.output_file = tokens[idx + 1]
+            console.print(f"[cyan]CSV output:[/] {args.output_file}")
+            idx += 2
+            continue
+
+        # --- not a flag → treat as IP ---
+        ip = normalize_ip(tok)
+        if ip:
+            ip_list.append(ip)
+        elif tok.startswith("-"):
+            console.print(
+                f"[yellow]Warning:[/] Unknown option '{tok}'. Type [bold]help[/] for commands."
+            )
+        else:
+            console.print(
+                f"[yellow]Warning:[/] '{tok}' is not a valid IP address."
+            )
+        idx += 1
+
+    return ip_list
+
+
+_SENTINEL_EXIT: list[str] = []   # identity-compared, never returned otherwise
+_SENTINEL_NO_IPS: list[str] = []
+
+
+def get_ip_list_from_prompt(
+    console: Console,
+    args: argparse.Namespace,
+) -> list[str]:
+    """Prompt the user for IPs and/or runtime commands.
+
+    Returns ``_SENTINEL_EXIT`` when the user enters nothing (wants to quit),
+    ``_SENTINEL_NO_IPS`` when input was only commands (no IPs to look up),
+    or a non-empty IP list.
+    """
     ip_input = Prompt.ask(
-        "[bold cyan]Enter IPs[/] [dim](comma/semicolon-separated, empty to exit)[/]",
+        "[bold cyan]>[/]",
         default="",
         console=console,
     ).strip()
     if not ip_input:
-        return []
-    ip_list = re.split(r"[;,]", ip_input)
-    sanitized: list[str] = []
-    for raw_ip in ip_list:
-        ip = normalize_ip(raw_ip)
-        if ip:
-            sanitized.append(ip)
-    if len(sanitized) != len([ip for ip in ip_list if ip.strip()]):
-        console.print(
-            "[yellow]Warning:[/] One or more entries were ignored because they are not valid IPs."
-        )
-    return sanitized
+        return _SENTINEL_EXIT
+    ips = parse_interactive_input(ip_input, args, console)
+    return ips if ips else _SENTINEL_NO_IPS
 
 
 # ---------------------------------------------------------------------------
@@ -831,11 +1039,19 @@ def main() -> None:
         return
 
     # --- Interactive mode ---
+    console.print(
+        "[dim]Enter IP addresses to check. Type [bold]help[/dim][bold] for commands.[/]"
+    )
     while True:
-        ip_list = get_ip_list_from_prompt(console)
-        if not ip_list:
+        ip_list = get_ip_list_from_prompt(console, args)
+        if ip_list is _SENTINEL_EXIT:
             console.print("[dim]Exiting… Goodbye![/]")
             break
+        if ip_list is _SENTINEL_NO_IPS:
+            # User typed only commands (e.g. "-v"), no IPs to look up
+            continue
+        # Re-read headers in case verbose was toggled
+        headers = get_headers(args.verbose)
         rows = fetch_results(
             ip_list, api_key, max_age_days=args.days, console=console
         )

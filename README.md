@@ -13,6 +13,8 @@ colored output, animated progress indicators, and flexible input/output options.
   progress bar.
 - **Rich terminal UI**: Color-coded tables, risk-level summary panel, and
   styled prompts.
+- **API key validation**: The key is validated against the API before use.
+  Invalid keys are rejected immediately with a clear error.
 - **API key caching**: The key is cached for 1 hour after first entry so you
   don't have to re-enter it every time. Use `--clear-key` to reset.
 - **Rate-limit awareness**: Displays remaining API quota after each run,
@@ -29,6 +31,9 @@ colored output, animated progress indicators, and flexible input/output options.
 - **Verbose mode**: Use `-v` to see extra fields (ISP, lastReportedAt,
   numDistinctUsers).
 - **CSV output**: Save results to a CSV file with `-o`.
+- **Interactive commands**: Toggle options like `-v`, `--sort`, `-t`, `--export`
+  at the interactive prompt without restarting. Type `help` for a list,
+  `usage` to check API quota.
 - **Tab completion**: Shell completions for bash/zsh/fish via `argcomplete`.
 
 ## Requirements
@@ -110,6 +115,27 @@ python abuseipdb_cli.py -i ips.csv --no-color
 | `--clear-key` | Clear cached API key and re-prompt |
 | `--version` | Show version |
 | `-h` / `--help` | Show help |
+
+## Interactive Mode Commands
+
+When running in interactive mode (no `-i` flag), you can type commands at the
+`>` prompt alongside IP addresses:
+
+| Command | Description |
+|---------|-------------|
+| `-v` | Toggle verbose mode |
+| `-d N` | Set max report age (e.g. `-d 30`) |
+| `-t N` | Set score threshold (e.g. `-t 50`) |
+| `-x` | Set threshold to 100 |
+| `--sort KEY` | Sort by: score, reports, country, ip |
+| `--export FILE` | Export next results to HTML |
+| `-o FILE` | Write next results to CSV |
+| `--json` | Toggle JSON output |
+| `usage` | Show API rate-limit / quota status |
+| `help` | Show help |
+| *(empty)* | Exit |
+
+You can mix IPs and commands: `8.8.8.8 1.1.1.1 -v --sort score`
 
 ## API Key
 
