@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# PYTHON_ARGCOMPLETE_OK
 """
 AbuseIPDB Quick Check Tool
 ==========================
@@ -14,6 +15,9 @@ Usage:
     python abuseipdb_cli.py -i ips.csv -o out.csv       # write results to CSV
     python abuseipdb_cli.py -i ips.csv -t 50 -v         # threshold + verbose
     python abuseipdb_cli.py -i ips.csv --json            # JSON output for piping
+    cat ips.txt | python abuseipdb_cli.py -              # read IPs from stdin
+    python abuseipdb_cli.py -i ips.csv --sort score      # sort by score
+    python abuseipdb_cli.py -i ips.csv --export report.html  # HTML report
 
 The API key is resolved in order: ABUSEIPDB_API_KEY env var → cached key
 (valid for 1 hour) → interactive prompt.
@@ -25,6 +29,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import html as html_mod
 import json
 import os
 import re
@@ -51,7 +56,14 @@ from rich.prompt import Prompt
 from rich.text import Text
 from rich import box
 
-__version__ = "2.0.0"
+try:
+    import argcomplete
+
+    _HAS_ARGCOMPLETE = True
+except ImportError:
+    _HAS_ARGCOMPLETE = False
+
+__version__ = "2.1.0"
 
 # ---------------------------------------------------------------------------
 # Column definitions
@@ -99,6 +111,9 @@ def parse_args() -> argparse.Namespace:
             "  python abuseipdb_cli.py -i ips.csv -v\n"
             "  python abuseipdb_cli.py -i ips.csv -o out.csv -t 50\n"
             "  python abuseipdb_cli.py --json -i ips.csv\n"
+            "  cat ips.txt | python abuseipdb_cli.py -\n"
+            "  python abuseipdb_cli.py -i ips.csv --sort score\n"
+            "  python abuseipdb_cli.py -i ips.csv --export report.html\n"
         ),
         formatter_class=argparse.RawTextHelpFormatter,
     )
@@ -158,6 +173,18 @@ def parse_args() -> argparse.Namespace:
         help="Disable colored output (useful for scripts/piping).",
     )
     parser.add_argument(
+        "--sort",
+        choices=["score", "reports", "country", "ip"],
+        default=None,
+        help="Sort results by field (score, reports, country, ip).",
+    )
+    parser.add_argument(
+        "--export",
+        metavar="FILE.html",
+        default=None,
+        help="Export results as a self-contained HTML report.",
+    )
+    parser.add_argument(
         "--clear-key",
         action="store_true",
         help="Clear the cached API key and prompt for a new one.",
@@ -167,6 +194,10 @@ def parse_args() -> argparse.Namespace:
         action="version",
         version=f"%(prog)s {__version__}",
     )
+
+    if _HAS_ARGCOMPLETE:
+        argcomplete.autocomplete(parser)
+
     return parser.parse_args()
 
 
@@ -275,6 +306,29 @@ def read_ips_from_csv(path: str, console: Console) -> list[str]:
     return ips
 
 
+def read_ips_from_stdin(console: Console) -> list[str]:
+    """Read IP addresses from stdin (one per line, or comma/semicolon-separated)."""
+    ips: list[str] = []
+    invalid_count = 0
+    for raw_line in sys.stdin:
+        for chunk in re.split(r"[;,]", raw_line):
+            chunk = chunk.strip()
+            if not chunk:
+                continue
+            ip = normalize_ip(chunk)
+            if ip:
+                ips.append(ip)
+            else:
+                invalid_count += 1
+    if invalid_count:
+        console.print(
+            f"[yellow]Warning:[/] Skipped {invalid_count} "
+            f"entr{'y' if invalid_count == 1 else 'ies'} "
+            "from stdin that were not valid IP addresses."
+        )
+    return ips
+
+
 def get_ip_list_from_prompt(console: Console) -> list[str]:
     """Prompt the user for IP addresses separated by commas or semicolons."""
     ip_input = Prompt.ask(
@@ -318,6 +372,11 @@ def build_error_result(ip: str, message: str) -> dict:
     }
 
 
+# Shared mutable state for rate-limit info (updated from worker threads).
+_rate_limit_info: dict[str, str] = {}
+_rate_limit_lock = __import__("threading").Lock()
+
+
 def check_ip(
     session: requests.Session,
     api_key: str,
@@ -340,6 +399,12 @@ def check_ip(
             params={"ipAddress": ip, "maxAgeInDays": max_age_days},
             timeout=10,
         )
+        # Capture rate-limit headers from the most recent response
+        with _rate_limit_lock:
+            for hdr in ("X-RateLimit-Limit", "X-RateLimit-Remaining", "Retry-After"):
+                val = resp.headers.get(hdr)
+                if val is not None:
+                    _rate_limit_info[hdr] = val
         resp.raise_for_status()
         return resp.json().get("data", {})
     except requests.exceptions.HTTPError as http_err:
@@ -482,6 +547,151 @@ def print_summary(rows: list[dict], console: Console) -> None:
     )
 
 
+def print_rate_limit(console: Console) -> None:
+    """Display API rate-limit information if available."""
+    info = _rate_limit_info.copy()
+    if not info:
+        return
+    limit = info.get("X-RateLimit-Limit", "?")
+    remaining = info.get("X-RateLimit-Remaining", "?")
+    retry = info.get("Retry-After")
+
+    try:
+        remaining_int = int(remaining)
+        limit_int = int(limit)
+        pct = remaining_int / limit_int * 100 if limit_int else 0
+        if pct <= 10:
+            color = "bold red"
+        elif pct <= 30:
+            color = "yellow"
+        else:
+            color = "green"
+    except (ValueError, TypeError):
+        color = "dim"
+
+    parts = [f"[{color}]{remaining}[/]/{limit} requests remaining"]
+    if retry:
+        parts.append(f"  [dim](resets in {retry}s)[/]")
+    console.print(
+        Panel("".join(parts), title="API Rate Limit", border_style="dim", expand=False)
+    )
+
+
+def sort_results(rows: list[dict], sort_key: str | None) -> list[dict]:
+    """Sort result rows by the given key."""
+    if not sort_key:
+        return rows
+
+    key_map = {
+        "score": "abuseConfidenceScore",
+        "reports": "totalReports",
+        "country": "countryCode",
+        "ip": "ipAddress",
+    }
+    field = key_map.get(sort_key)
+    if not field:
+        return rows
+
+    def sort_val(row: dict):
+        v = row.get(field, "")
+        if field in ("abuseConfidenceScore", "totalReports"):
+            try:
+                return int(v)
+            except (ValueError, TypeError):
+                return -1
+        return str(v)
+
+    reverse = sort_key in ("score", "reports")
+    return sorted(rows, key=sort_val, reverse=reverse)
+
+
+def export_html(path: str, rows: list[dict], headers: list[str], console: Console) -> None:
+    """Generate a self-contained HTML report file."""
+    e = html_mod.escape
+
+    style = """
+    <style>
+      body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+             margin: 2rem; background: #0d1117; color: #c9d1d9; }
+      h1 { color: #58a6ff; }
+      .meta { color: #8b949e; margin-bottom: 1rem; }
+      table { border-collapse: collapse; width: 100%; margin-top: 1rem; }
+      th { background: #161b22; color: #58a6ff; text-align: left;
+           padding: 10px 12px; border: 1px solid #30363d; }
+      td { padding: 8px 12px; border: 1px solid #30363d; }
+      tr:nth-child(even) { background: #161b22; }
+      .high { color: #f85149; font-weight: bold; }
+      .medium { color: #d29922; }
+      .low { color: #c9d1d9; }
+      .clean { color: #3fb950; font-weight: bold; }
+      .error { color: #8b949e; font-style: italic; }
+      .summary { margin-top: 1.5rem; padding: 1rem; border: 1px solid #30363d;
+                  border-radius: 6px; background: #161b22; }
+      .summary span { margin-right: 1.5rem; }
+    </style>"""
+
+    # Build summary stats
+    scores: list[int] = []
+    for r in rows:
+        try:
+            scores.append(int(r.get("abuseConfidenceScore", 0)))
+        except (ValueError, TypeError):
+            pass
+    total = len(rows)
+    high = sum(1 for s in scores if s >= 75)
+    medium = sum(1 for s in scores if 50 <= s < 75)
+    low = sum(1 for s in scores if 0 < s < 50)
+    clean = sum(1 for s in scores if s == 0)
+
+    html_parts = [
+        "<!DOCTYPE html>",
+        "<html lang='en'><head><meta charset='utf-8'>",
+        f"<title>AbuseIPDB Report</title>{style}</head><body>",
+        "<h1>AbuseIPDB Quick Check Report</h1>",
+        f"<p class='meta'>Generated: {time.strftime('%Y-%m-%d %H:%M:%S')} "
+        f"&mdash; {total} IPs checked &mdash; v{__version__}</p>",
+        "<div class='summary'>",
+        f"<span><strong>Total:</strong> {total}</span>",
+        f"<span class='high'>High (≥75): {high}</span>",
+        f"<span class='medium'>Medium (50-74): {medium}</span>",
+        f"<span class='low'>Low (1-49): {low}</span>",
+        f"<span class='clean'>Clean (0): {clean}</span>",
+        "</div>",
+        "<table><thead><tr>",
+    ]
+    for h in headers:
+        html_parts.append(f"<th>{e(h)}</th>")
+    html_parts.append("</tr></thead><tbody>")
+
+    for row in rows:
+        score = row.get("abuseConfidenceScore", "N/A")
+        try:
+            s = int(score)
+            if s >= 75:
+                cls = "high"
+            elif s >= 50:
+                cls = "medium"
+            elif s > 0:
+                cls = "low"
+            else:
+                cls = "clean"
+        except (ValueError, TypeError):
+            cls = "error"
+        html_parts.append(f"<tr class='{cls}'>")
+        for h in headers:
+            html_parts.append(f"<td>{e(str(row.get(h, 'N/A')))}</td>")
+        html_parts.append("</tr>")
+
+    html_parts.append("</tbody></table></body></html>")
+
+    try:
+        with open(path, "w", encoding="utf-8") as f:
+            f.write("\n".join(html_parts))
+        console.print(f"[green]Success:[/] HTML report written to '{path}'.")
+    except OSError as exc:
+        console.print(f"[bold red]Error:[/] Failed to write HTML '{path}': {exc}")
+
+
 def output_results(
     rows: list[dict],
     args: argparse.Namespace,
@@ -497,6 +707,12 @@ def output_results(
     else:
         print_table(rows, headers, console)
         print_summary(rows, console)
+    # HTML export (can be combined with any other output)
+    if args.export:
+        export_html(args.export, rows, headers, console)
+    # Always show rate-limit info (unless JSON mode)
+    if not args.json_output:
+        print_rate_limit(console)
 
 
 # ---------------------------------------------------------------------------
@@ -559,7 +775,7 @@ def main() -> None:
     headers = get_headers(args.verbose)
 
     # Validate positional IP early (before prompting for API key)
-    if args.ip:
+    if args.ip and args.ip != "-":
         validated_ip = normalize_ip(args.ip)
         if not validated_ip:
             console.print(
@@ -575,9 +791,22 @@ def main() -> None:
     api_key = resolve_api_key(console, clear_cache=args.clear_key)
 
     # --- Positional single-IP lookup ---
-    if args.ip:
+    if args.ip and args.ip != "-":
         rows = fetch_results([validated_ip], api_key, max_age_days=args.days, console=console)
         rows = apply_threshold(rows, args.threshold)
+        rows = sort_results(rows, args.sort)
+        output_results(rows, args, headers, console)
+        return
+
+    # --- Stdin pipe mode: `command | abuseipdb_cli.py -` ---
+    if args.ip == "-" or (not args.ip and not args.input_file and not sys.stdin.isatty()):
+        ip_list = read_ips_from_stdin(console)
+        if not ip_list:
+            console.print("[yellow]Warning:[/] No valid IPs received from stdin.")
+            sys.exit(0)
+        rows = fetch_results(ip_list, api_key, max_age_days=args.days, console=console)
+        rows = apply_threshold(rows, args.threshold)
+        rows = sort_results(rows, args.sort)
         output_results(rows, args, headers, console)
         return
 
@@ -597,6 +826,7 @@ def main() -> None:
             ip_list, api_key, max_age_days=args.days, console=console
         )
         rows = apply_threshold(rows, args.threshold)
+        rows = sort_results(rows, args.sort)
         output_results(rows, args, headers, console)
         return
 
@@ -610,6 +840,7 @@ def main() -> None:
             ip_list, api_key, max_age_days=args.days, console=console
         )
         rows = apply_threshold(rows, args.threshold)
+        rows = sort_results(rows, args.sort)
         output_results(rows, args, headers, console)
 
 
