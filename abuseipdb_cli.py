@@ -539,6 +539,44 @@ _SENTINEL_EXIT: list[str] = []   # identity-compared, never returned otherwise
 _SENTINEL_NO_IPS: list[str] = []
 
 
+def _drain_pasted_lines(initial_timeout: float = 0.05) -> str:
+    """Read any additional lines already buffered on stdin without blocking.
+
+    When the user pastes multi-line content the terminal delivers it as a
+    burst of newline-terminated lines. ``input()`` only consumes the first;
+    the rest sit in the kernel pty buffer. This helper drains them so the
+    whole paste can be treated as a single command.
+
+    Returns "" on platforms where ``select`` doesn't support stdin (e.g.
+    Windows) or when no extra data is pending.
+    """
+    try:
+        import select
+    except ImportError:
+        return ""
+    if not sys.stdin.isatty():
+        return ""
+
+    lines: list[str] = []
+    timeout = initial_timeout
+    while True:
+        try:
+            ready, _, _ = select.select([sys.stdin], [], [], timeout)
+        except (OSError, ValueError):
+            break
+        if not ready:
+            break
+        try:
+            line = sys.stdin.readline()
+        except (OSError, EOFError):
+            break
+        if not line:
+            break
+        lines.append(line.rstrip("\r\n"))
+        timeout = 0  # subsequent polls: only drain what's already there
+    return "\n".join(lines)
+
+
 def get_ip_list_from_prompt(
     console: Console,
     args: argparse.Namespace,
@@ -557,6 +595,10 @@ def get_ip_list_from_prompt(
     ).strip()
     if not ip_input:
         return _SENTINEL_EXIT
+    # Coalesce multi-line clipboard pastes into a single command.
+    extra = _drain_pasted_lines()
+    if extra:
+        ip_input = ip_input + "\n" + extra
     ips = parse_interactive_input(ip_input, args, console, api_key=api_key)
     return ips if ips else _SENTINEL_NO_IPS
 
