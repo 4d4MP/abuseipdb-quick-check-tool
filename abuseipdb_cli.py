@@ -428,6 +428,7 @@ def parse_interactive_input(
     raw: str,
     args: argparse.Namespace,
     console: Console,
+    api_key: str | None = None,
 ) -> list[str]:
     """Parse interactive input that may contain a mix of IPs and runtime flags.
 
@@ -450,7 +451,7 @@ def parse_interactive_input(
             continue
 
         if tok == "usage":
-            print_rate_limit(console)
+            print_rate_limit(console, api_key=api_key)
             idx += 1
             continue
 
@@ -541,6 +542,7 @@ _SENTINEL_NO_IPS: list[str] = []
 def get_ip_list_from_prompt(
     console: Console,
     args: argparse.Namespace,
+    api_key: str | None = None,
 ) -> list[str]:
     """Prompt the user for IPs and/or runtime commands.
 
@@ -555,7 +557,7 @@ def get_ip_list_from_prompt(
     ).strip()
     if not ip_input:
         return _SENTINEL_EXIT
-    ips = parse_interactive_input(ip_input, args, console)
+    ips = parse_interactive_input(ip_input, args, console, api_key=api_key)
     return ips if ips else _SENTINEL_NO_IPS
 
 
@@ -702,17 +704,42 @@ def print_table(ip_results: list[dict], headers: list[str], console: Console) ->
     console.print(table)
 
 
+def _expand_path(path: str) -> str:
+    """Expand ``~`` and ``$VAR`` tokens in a user-supplied path."""
+    return os.path.expanduser(os.path.expandvars(path))
+
+
+def _resolve_output_path(path: str, default_name: str) -> str:
+    """Expand a path and, if it points to a directory, append a default filename.
+
+    A trailing separator or an existing directory is treated as "save into this
+    folder with an auto-generated filename".
+    """
+    expanded = _expand_path(path)
+    looks_like_dir = (
+        expanded.endswith(os.sep)
+        or expanded.endswith("/")
+        or os.path.isdir(expanded)
+    )
+    if looks_like_dir:
+        expanded = os.path.join(expanded.rstrip("/" + os.sep), default_name)
+    return expanded
+
+
 def write_csv(path: str, rows: list[dict], headers: list[str], console: Console) -> None:
     """Write results to a CSV file."""
+    resolved = _resolve_output_path(
+        path, f"abuseipdb_report_{time.strftime('%Y%m%d_%H%M%S')}.csv"
+    )
     try:
-        with open(path, "w", encoding="utf-8", newline="") as f:
+        with open(resolved, "w", encoding="utf-8", newline="") as f:
             writer = csv.DictWriter(f, fieldnames=headers)
             writer.writeheader()
             for r in rows:
                 writer.writerow({k: r.get(k, "N/A") for k in headers})
-        console.print(f"[green]Success:[/] Wrote {len(rows)} rows to '{path}'.")
+        console.print(f"[green]Success:[/] Wrote {len(rows)} rows to '{resolved}'.")
     except OSError as e:
-        console.print(f"[bold red]Error:[/] Failed to write CSV '{path}': {e}")
+        console.print(f"[bold red]Error:[/] Failed to write CSV '{resolved}': {e}")
 
 
 def print_summary(rows: list[dict], console: Console) -> None:
@@ -774,10 +801,23 @@ def print_summary(rows: list[dict], console: Console) -> None:
     )
 
 
-def print_rate_limit(console: Console) -> None:
-    """Display API rate-limit information if available."""
+def _refresh_rate_limit(api_key: str) -> None:
+    """Populate ``_rate_limit_info`` via a lightweight API call."""
+    _validate_api_key(api_key)  # side-effect: captures rate-limit headers
+
+
+def print_rate_limit(console: Console, api_key: str | None = None) -> None:
+    """Display API rate-limit information, fetching it live if necessary."""
     info = _rate_limit_info.copy()
+    if not info and api_key:
+        with console.status("[dim]Fetching API quota…[/]", spinner="dots"):
+            _refresh_rate_limit(api_key)
+        info = _rate_limit_info.copy()
     if not info:
+        console.print(
+            "[yellow]No API usage data available yet.[/] "
+            "Run a query first, or set the [bold]ABUSEIPDB_API_KEY[/] env var."
+        )
         return
     limit = info.get("X-RateLimit-Limit", "?")
     remaining = info.get("X-RateLimit-Remaining", "?")
@@ -911,12 +951,15 @@ def export_html(path: str, rows: list[dict], headers: list[str], console: Consol
 
     html_parts.append("</tbody></table></body></html>")
 
+    resolved = _resolve_output_path(
+        path, f"abuseipdb_report_{time.strftime('%Y%m%d_%H%M%S')}.html"
+    )
     try:
-        with open(path, "w", encoding="utf-8") as f:
+        with open(resolved, "w", encoding="utf-8") as f:
             f.write("\n".join(html_parts))
-        console.print(f"[green]Success:[/] HTML report written to '{path}'.")
+        console.print(f"[green]Success:[/] HTML report written to '{resolved}'.")
     except OSError as exc:
-        console.print(f"[bold red]Error:[/] Failed to write HTML '{path}': {exc}")
+        console.print(f"[bold red]Error:[/] Failed to write HTML '{resolved}': {exc}")
 
 
 def output_results(
@@ -985,6 +1028,41 @@ def print_banner(console: Console) -> None:
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
+
+
+def _setup_readline() -> None:
+    """Enable tab completion (incl. path expansion) at the interactive prompt.
+
+    Works with both GNU readline (Linux) and libedit (stock macOS Python).
+    Safe to call on systems without readline — silently skips.
+    """
+    try:
+        import readline
+        import glob
+    except ImportError:
+        return  # e.g. Windows without pyreadline
+
+    def _path_completer(text: str, state: int) -> str | None:
+        expanded = os.path.expanduser(text)
+        matches = glob.glob(expanded + "*")
+        matches = [m + ("/" if os.path.isdir(m) else "") for m in matches]
+        # Preserve the user's leading "~" so the prompt stays tidy.
+        if text.startswith("~"):
+            home = os.path.expanduser("~")
+            matches = [
+                (m.replace(home, "~", 1) if m.startswith(home) else m)
+                for m in matches
+            ]
+        return matches[state] if state < len(matches) else None
+
+    readline.set_completer(_path_completer)
+    # "/" and "~" are part of a path token; don't treat them as delimiters.
+    readline.set_completer_delims(" \t\n;")
+
+    if "libedit" in (readline.__doc__ or ""):
+        readline.parse_and_bind("bind ^I rl_complete")  # macOS libedit
+    else:
+        readline.parse_and_bind("tab: complete")  # GNU readline
 
 
 def main() -> None:
@@ -1059,11 +1137,12 @@ def main() -> None:
         return
 
     # --- Interactive mode ---
+    _setup_readline()
     console.print(
         "[dim]Enter IP addresses to check. Type [bold]help[/dim][bold] for commands.[/]"
     )
     while True:
-        ip_list = get_ip_list_from_prompt(console, args)
+        ip_list = get_ip_list_from_prompt(console, args, api_key=api_key)
         if ip_list is _SENTINEL_EXIT:
             console.print("[dim]Exiting… Goodbye![/]")
             break
