@@ -1139,7 +1139,7 @@ def main() -> None:
     # --- Interactive mode ---
     _setup_readline()
     console.print(
-        "[dim]Enter IP addresses to check. Type [bold]help[/dim][bold] for commands.[/]"
+        "[dim]Enter IP addresses to check. Type [bold]help[/bold] for commands.[/dim]"
     )
     while True:
         ip_list = get_ip_list_from_prompt(console, args, api_key=api_key)
