@@ -539,13 +539,19 @@ _SENTINEL_EXIT: list[str] = []   # identity-compared, never returned otherwise
 _SENTINEL_NO_IPS: list[str] = []
 
 
-def _drain_pasted_lines(initial_timeout: float = 0.05) -> str:
+def _drain_pasted_lines(settle_timeout: float = 0.2) -> str:
     """Read any additional lines already buffered on stdin without blocking.
 
     When the user pastes multi-line content the terminal delivers it as a
     burst of newline-terminated lines. ``input()`` only consumes the first;
     the rest sit in the kernel pty buffer. This helper drains them so the
     whole paste can be treated as a single command.
+
+    The first poll is non-blocking, so a normally-typed line adds zero
+    latency. Once we've drained at least one extra line we know we're in
+    a paste burst and switch to a short settle window between reads to
+    catch stragglers (the kernel may make the next line readable a few
+    ms after the previous one was consumed).
 
     Returns "" on platforms where ``select`` doesn't support stdin (e.g.
     Windows) or when no extra data is pending.
@@ -558,7 +564,7 @@ def _drain_pasted_lines(initial_timeout: float = 0.05) -> str:
         return ""
 
     lines: list[str] = []
-    timeout = initial_timeout
+    timeout = 0.0  # first poll: instant — typed input doesn't pay any latency
     while True:
         try:
             ready, _, _ = select.select([sys.stdin], [], [], timeout)
@@ -573,7 +579,9 @@ def _drain_pasted_lines(initial_timeout: float = 0.05) -> str:
         if not line:
             break
         lines.append(line.rstrip("\r\n"))
-        timeout = 0  # subsequent polls: only drain what's already there
+        # We're inside a paste burst now — wait briefly for the next line
+        # in case it hasn't quite landed in the buffer yet.
+        timeout = settle_timeout
     return "\n".join(lines)
 
 
